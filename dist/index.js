@@ -9679,7 +9679,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.QUESTIONS = exports.INPUT_KEYS = exports.COMMIT_KEYS = exports.CHECKLIST_KEYS = void 0;
+exports.PULL_REQUEST = exports.QUESTIONS = exports.INPUT_KEYS = exports.COMMIT_KEYS = exports.CHECKLIST_KEYS = void 0;
 const checklistKeys_1 = __importDefault(__nccwpck_require__(6068));
 exports.CHECKLIST_KEYS = checklistKeys_1.default;
 const commitKeys_1 = __importDefault(__nccwpck_require__(2546));
@@ -9688,6 +9688,8 @@ const inputKeys_1 = __importDefault(__nccwpck_require__(9913));
 exports.INPUT_KEYS = inputKeys_1.default;
 const questions_1 = __importDefault(__nccwpck_require__(8080));
 exports.QUESTIONS = questions_1.default;
+const pullRequest_1 = __importDefault(__nccwpck_require__(577));
+exports.PULL_REQUEST = pullRequest_1.default;
 
 
 /***/ }),
@@ -9703,9 +9705,37 @@ const INPUT_KEYS = Object.freeze({
     ASSIGNEE_REQUIRED: 'assigneeRequired',
     CHECKLIST_REQUIRED: 'checklistRequired',
     SEMANTIC_TITLE_REQUIRED: 'semanticTitleRequired',
+    SEMANTIC_BRANCH_NAME_REQUIRED: 'semanticBranchNameRequired',
     REPO_TOKEN: 'repoToken'
 });
 exports["default"] = INPUT_KEYS;
+
+
+/***/ }),
+
+/***/ 577:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const PULL_REQUEST = Object.freeze({
+    PREFIXES: Object.freeze([
+        'build',
+        'chore',
+        'ci',
+        'docs',
+        'feature',
+        'feat',
+        'fix',
+        'perf',
+        'refactor',
+        'revert',
+        'style',
+        'test'
+    ])
+});
+exports["default"] = PULL_REQUEST;
 
 
 /***/ }),
@@ -9779,12 +9809,14 @@ function useInputs() {
     const isAssigneeRequired = Boolean(core.getInput(constants_1.INPUT_KEYS.ASSIGNEE_REQUIRED, { required: true }));
     const isChecklistRequired = Boolean(core.getInput(constants_1.INPUT_KEYS.CHECKLIST_REQUIRED, { required: true }));
     const isSemanticTitleRequired = Boolean(core.getInput(constants_1.INPUT_KEYS.SEMANTIC_TITLE_REQUIRED, { required: true }));
+    const isSemanticBranchNameRequired = Boolean(core.getInput(constants_1.INPUT_KEYS.SEMANTIC_BRANCH_NAME_REQUIRED, { required: true }));
     const repoToken = core.getInput(constants_1.INPUT_KEYS.REPO_TOKEN, { required: true });
     return {
         isReviewerRequired,
         isAssigneeRequired,
         isChecklistRequired,
         isSemanticTitleRequired,
+        isSemanticBranchNameRequired,
         repoToken
     };
 }
@@ -9876,6 +9908,10 @@ async function removeOldPRComments() {
         if (!comment.body?.includes('BOT MESSAGE')) {
             return;
         }
+        // skip replies
+        if (comment.body?.includes('> BOT MESSAGE')) {
+            return;
+        }
         octokit.rest.issues.deleteComment({
             ...github.context.repo,
             comment_id: comment.id
@@ -9883,9 +9919,18 @@ async function removeOldPRComments() {
     });
 }
 async function commentErrors(errors) {
-    const { isDraft, PROwner } = await lib_1.pullRequest.getPRInfo();
+    const { isDraft, PROwner, isMerged, isClosed } = await lib_1.pullRequest.getPRInfo();
+    if (isMerged || isClosed) {
+        return;
+    }
     if (isDraft) {
-        commentDraftPR();
+        await removeOldPRComments();
+        await commentDraftPR();
+        return;
+    }
+    if (await lib_1.pullRequest.missingSemanticBranchName()) {
+        await removeOldPRComments();
+        await commentAndClosePR();
         return;
     }
     await removeOldPRComments();
@@ -9917,6 +9962,20 @@ async function commentDraftPR() {
         ...github.context.repo,
         issue_number: github.context.issue.number,
         body: `BOT MESSAGE :robot:\n\n\nPullMate skips the checklist for draft PRs :construction:`
+    });
+}
+async function commentAndClosePR() {
+    const octokit = (0, hooks_1.useOctokit)();
+    const { PROwner } = await lib_1.pullRequest.getPRInfo();
+    await octokit.rest.issues.createComment({
+        ...github.context.repo,
+        issue_number: github.context.issue.number,
+        body: `BOT MESSAGE :robot:\n\n\nPlease follow the semantic branch naming convention :construction:\n\nSee the [Semantic Branch Name Documentation](https://github.com/shftco/shft-pullmate/blob/main/docs/SEMANTIC_BRANCH_NAMING.md) for more information.\n\n\n@${PROwner}`
+    });
+    await octokit.rest.pulls.update({
+        ...github.context.repo,
+        pull_number: github.context.issue.number,
+        state: 'closed'
     });
 }
 exports["default"] = { commentErrors };
@@ -10084,7 +10143,7 @@ function checkedImageOrVideo() {
 async function hasAnyImageOrVideo() {
     const rawContent = github.context.payload.pull_request?.body ?? '';
     const { repo, owner } = await lib_1.repository.getRepositoryInfo();
-    return rawContent.includes(`https://github.com/${owner}/${repo}/assets/`);
+    return rawContent.includes('https://github.com/user-attachments');
 }
 async function missingImageOrVideo() {
     if (!checkedImageOrVideo()) {
@@ -10170,7 +10229,9 @@ async function getPRInfo() {
         isClosed: issue?.data?.state === 'closed',
         isAssigned: !!issue?.data?.assignee,
         hasReviewers: !!PR?.data?.requested_reviewers?.length,
-        PROwner: PR?.data?.user?.login ?? ''
+        PROwner: PR?.data?.user?.login ?? '',
+        branchName: PR?.data?.head?.ref ?? '',
+        isMerged: PR?.data?.merged_at !== null
     };
 }
 async function hasSemanticTitle() {
@@ -10212,13 +10273,32 @@ async function missingReviewers() {
     }
     return !hasReviewers;
 }
+async function missingSemanticBranchName() {
+    const { isSemanticBranchNameRequired } = (0, hooks_1.useInputs)();
+    const { branchName } = await getPRInfo();
+    if (!isSemanticBranchNameRequired) {
+        return false;
+    }
+    return isInvalidBranchName(branchName);
+}
+function isInvalidBranchName(title) {
+    if (!constants_1.PULL_REQUEST.PREFIXES.some(prefix => title.startsWith(`${prefix}/`))) {
+        return true;
+    }
+    const titleRegex = /^[a-z]+(?:\/[a-z-]+)+$/;
+    if (!titleRegex.test(title)) {
+        return true;
+    }
+    return false;
+}
 exports["default"] = {
     getPRInfo,
     hasSemanticTitle,
     hasTaskNumber,
     missingAssignees,
     missingSemanticTitle,
-    missingReviewers
+    missingReviewers,
+    missingSemanticBranchName
 };
 
 
@@ -10322,7 +10402,7 @@ async function run() {
             errors.push('Pull request must have a checklist.');
         }
         if (await lib_1.pullRequest.missingSemanticTitle()) {
-            errors.push('Pull request must have a semantic title.');
+            errors.push('Pull request must have a semantic title. See the [Semantic Title Documentation](https://github.com/shftco/shft-pullmate/blob/main/docs/SEMANTIC_TITLE_NAMING.md) for more information.');
         }
         if (await lib_1.pullRequest.missingReviewers()) {
             errors.push('Pull request must have at least one reviewer.');

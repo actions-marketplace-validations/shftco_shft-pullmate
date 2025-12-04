@@ -17,6 +17,11 @@ async function removeOldPRComments() {
       return;
     }
 
+    // skip replies
+    if (comment.body?.includes('> BOT MESSAGE')) {
+      return;
+    }
+
     octokit.rest.issues.deleteComment({
       ...github.context.repo,
       comment_id: comment.id
@@ -25,10 +30,22 @@ async function removeOldPRComments() {
 }
 
 async function commentErrors(errors: string[]) {
-  const { isDraft, PROwner } = await pullRequest.getPRInfo();
+  const { isDraft, PROwner, isMerged, isClosed } =
+    await pullRequest.getPRInfo();
+
+  if (isMerged || isClosed) {
+    return;
+  }
 
   if (isDraft) {
-    commentDraftPR();
+    await removeOldPRComments();
+    await commentDraftPR();
+    return;
+  }
+
+  if (await pullRequest.missingSemanticBranchName()) {
+    await removeOldPRComments();
+    await commentAndClosePR();
     return;
   }
 
@@ -69,6 +86,23 @@ async function commentDraftPR() {
     ...github.context.repo,
     issue_number: github.context.issue.number,
     body: `BOT MESSAGE :robot:\n\n\nPullMate skips the checklist for draft PRs :construction:`
+  });
+}
+
+async function commentAndClosePR() {
+  const octokit = useOctokit();
+  const { PROwner } = await pullRequest.getPRInfo();
+
+  await octokit.rest.issues.createComment({
+    ...github.context.repo,
+    issue_number: github.context.issue.number,
+    body: `BOT MESSAGE :robot:\n\n\nPlease follow the semantic branch naming convention :construction:\n\nSee the [Semantic Branch Name Documentation](https://github.com/shftco/shft-pullmate/blob/main/docs/SEMANTIC_BRANCH_NAMING.md) for more information.\n\n\n@${PROwner}`
+  });
+
+  await octokit.rest.pulls.update({
+    ...github.context.repo,
+    pull_number: github.context.issue.number,
+    state: 'closed'
   });
 }
 
